@@ -2,68 +2,87 @@ import 'dart:convert';
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
 import 'package:shelf/shelf_io.dart' as io;
-import 'package:mysql1/mysql1.dart';
+import 'package:postgres/postgres.dart';
+
+class DatabaseManager {
+  final Endpoint endpoint;
+  final ConnectionSettings settings;
+  Connection? _conn;
+
+  DatabaseManager(this.endpoint, {SslMode? sslMode})
+      : settings = ConnectionSettings(sslMode: sslMode ?? SslMode.require);
+
+  // Função mágica que garante uma conexão ativa
+  Future<Connection> get connection async {
+    try {
+      // Se a conexão for nula ou o socket estiver fechado, tenta conectar
+      if (_conn == null) {
+        _conn = await Connection.open(endpoint, settings: settings);
+      }
+    } catch (e) {
+      print("🔄 Tentando reconectar ao PostgreSQL...");
+      _conn = await Connection.open(endpoint, settings: settings);
+    }
+    return _conn!;
+  }
+}
 
 void main() async {
-  final settings = ConnectionSettings(
-      host: '127.0.0.1',
-      port: 3306,
-      user: 'root',
-      password: '123321', 
-      db: 'novobd');
+  final endpoint = Endpoint(
+    host: '127.0.0.1',
+    port: 5433,
+    database: 'novobd',
+    username: 'postgres',
+    password: '123321',
+  );
+
+  final dbManager = DatabaseManager(endpoint, sslMode: SslMode.disable);
+
+  // Setup inicial
+  try {
+    final conn = await dbManager.connection;
+    await conn.execute("""
+      CREATE TABLE IF NOT EXISTS login (
+        usuario VARCHAR(50) PRIMARY KEY, 
+        senha VARCHAR(50)
+      )
+    """);
+    print("✅ Banco de dados pronto!");
+  } catch (e) {
+    print("❌ Erro inicial: $e");
+  }
 
   final router = Router();
 
   router.post('/login', (Request request) async {
-    MySqlConnection? conn;
     try {
       final payload = await request.readAsString();
       final data = jsonDecode(payload);
+      final String usuarioApp = data['usuario']?.toString().trim() ?? '';
+      final String senhaApp = data['senha']?.toString().trim() ?? '';
 
-      final String usuarioApp = data['usuario'].toString().trim();
-      final String senhaApp = data['senha'].toString().trim();
+      // SEMPRE pegamos a conexão através do manager
+      final conn = await dbManager.connection;
 
-      conn = await MySqlConnection.connect(settings);
-
-      // --- CORREÇÃO DO RANGEERROR ---
-      // Criamos a tabela com CHARSET latin1 para garantir que o Dart consiga ler os bytes
-      await conn.query("""
-        CREATE TABLE IF NOT EXISTS login (
-          usuario VARCHAR(50), 
-          senha VARCHAR(50)
-        ) CHARACTER SET latin1 COLLATE latin1_swedish_ci
-      """);
-
-      // Inserimos o admin de teste
-      await conn.query("REPLACE INTO login (usuario, senha) VALUES ('admin', '123321')");
-
-      // Buscamos o usuário
-      var results = await conn.query(
-        'SELECT usuario, senha FROM login WHERE usuario = ? AND senha = ?',
-        [usuarioApp, senhaApp],
+      var results = await conn.execute(
+        'SELECT usuario, senha FROM login WHERE usuario = \$1 AND senha = \$2',
+        parameters: [usuarioApp, senhaApp],
       );
 
-      print("\n--- [VERIFICAÇÃO] ---");
-      print("Tentativa: $usuarioApp");
-
       if (results.isNotEmpty) {
-        print("✅ SUCESSO!");
         return Response.ok(jsonEncode({'status': 'sucesso'}), headers: {'content-type': 'application/json'});
       } else {
-        print("❌ NÃO ENCONTRADO");
         return Response.forbidden(jsonEncode({'status': 'erro'}), headers: {'content-type': 'application/json'});
       }
     } catch (e) {
-      print("💥 ERRO TÉCNICO: $e");
-      return Response.internalServerError(body: jsonEncode({'erro': 'Erro no Banco'}));
-    } finally {
-      await conn?.close();
+      print("💥 Erro na rota: $e");
+      return Response.internalServerError(body: jsonEncode({'erro': 'Conexão perdida. Tente novamente.'}));
     }
   });
 
   final pipeline = Pipeline().addMiddleware(_fixCors()).addHandler(router.call);
-  await io.serve(pipeline, 'localhost', 8081);
-  print('🚀 Servidor pronto e protegido contra RangeError!');
+  await io.serve(pipeline, '0.0.0.0', 8081);
+  print('🚀 Servidor rodando em http://localhost:8081');
 }
 
 Middleware _fixCors() {
